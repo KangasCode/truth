@@ -72,10 +72,11 @@ def summarize_to_finnish(gemini_model: genai.GenerativeModel, post_content: str)
     """Use Gemini to summarize the post content into a single Finnish sentence."""
     try:
         prompt = (
-            "Olet avustaja, joka tiivistää sosiaalisen median julkaisuja. "
-            "Tiivistä annettu julkaisu yhdeksi ytimekkääksi suomenkieliseksi lauseeksi. "
-            "Pidä tiivistelmä lyhyenä ja informatiivisena, sopivana tekstiviestiin.\n\n"
-            f"Tiivistä tämä julkaisu suomeksi yhdellä lauseella:\n\n{post_content}"
+            "Tiivistä seuraava Trumpin julkaisu suomeksi MAKSIMISSAAN 130 merkillä. "
+            "TÄRKEÄÄ: Älä heikennä tai pehmentä Trumpin käyttämiä sanoja - säilytä alkuperäinen sävy ja voima. "
+            "Voit laittaa sulkeisiin englanninkielisen alkuperäisen sanan jos se on olennainen, esim. 'valeuutiset (Fake News)'. "
+            "Vastaa VAIN tiivistelmällä, ei mitään muuta.\n\n"
+            f"Julkaisu:\n{post_content}"
         )
         response = gemini_model.generate_content(prompt)
         summary = response.text.strip()
