@@ -11,7 +11,7 @@ import logging
 from datetime import datetime
 
 from truthbrush import Api as TruthApi
-from openai import OpenAI
+import google.generativeai as genai
 from twilio.rest import Client as TwilioClient
 
 # Configure logging
@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 # Environment variables
 TRUTH_SOCIAL_USERNAME = os.getenv("TRUTH_SOCIAL_USERNAME")
 TRUTH_SOCIAL_PASSWORD = os.getenv("TRUTH_SOCIAL_PASSWORD")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 TWILIO_FROM_NUMBER = os.getenv("TWILIO_FROM_NUMBER")
@@ -42,7 +42,7 @@ def validate_env_vars() -> bool:
     required_vars = [
         ("TRUTH_SOCIAL_USERNAME", TRUTH_SOCIAL_USERNAME),
         ("TRUTH_SOCIAL_PASSWORD", TRUTH_SOCIAL_PASSWORD),
-        ("OPENAI_API_KEY", OPENAI_API_KEY),
+        ("GEMINI_API_KEY", GEMINI_API_KEY),
         ("TWILIO_ACCOUNT_SID", TWILIO_ACCOUNT_SID),
         ("TWILIO_AUTH_TOKEN", TWILIO_AUTH_TOKEN),
         ("TWILIO_FROM_NUMBER", TWILIO_FROM_NUMBER),
@@ -68,33 +68,21 @@ def fetch_latest_statuses(truth_api: TruthApi) -> list:
         return []
 
 
-def summarize_to_finnish(openai_client: OpenAI, post_content: str) -> str | None:
-    """Use OpenAI to summarize the post content into a single Finnish sentence."""
+def summarize_to_finnish(gemini_model: genai.GenerativeModel, post_content: str) -> str | None:
+    """Use Gemini to summarize the post content into a single Finnish sentence."""
     try:
-        response = openai_client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "Olet avustaja, joka tiivistää sosiaalisen median julkaisuja. "
-                        "Tiivistä annettu julkaisu yhdeksi ytimekkääksi suomenkieliseksi lauseeksi. "
-                        "Pidä tiivistelmä lyhyenä ja informatiivisena, sopivana tekstiviestiin."
-                    ),
-                },
-                {
-                    "role": "user",
-                    "content": f"Tiivistä tämä julkaisu suomeksi yhdellä lauseella:\n\n{post_content}",
-                },
-            ],
-            max_tokens=150,
-            temperature=0.7,
+        prompt = (
+            "Olet avustaja, joka tiivistää sosiaalisen median julkaisuja. "
+            "Tiivistä annettu julkaisu yhdeksi ytimekkääksi suomenkieliseksi lauseeksi. "
+            "Pidä tiivistelmä lyhyenä ja informatiivisena, sopivana tekstiviestiin.\n\n"
+            f"Tiivistä tämä julkaisu suomeksi yhdellä lauseella:\n\n{post_content}"
         )
-        summary = response.choices[0].message.content.strip()
+        response = gemini_model.generate_content(prompt)
+        summary = response.text.strip()
         logger.info(f"Generated Finnish summary: {summary}")
         return summary
     except Exception as e:
-        logger.error(f"Failed to summarize post with OpenAI: {e}")
+        logger.error(f"Failed to summarize post with Gemini: {e}")
         return None
 
 
@@ -150,8 +138,9 @@ def main():
         logger.error(f"Failed to initialize Truth Social API: {e}")
         return
     
-    openai_client = OpenAI(api_key=OPENAI_API_KEY)
-    logger.info("OpenAI client initialized")
+    genai.configure(api_key=GEMINI_API_KEY)
+    gemini_model = genai.GenerativeModel("gemini-1.5-flash")
+    logger.info("Gemini client initialized")
     
     twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
     logger.info("Twilio client initialized")
@@ -208,7 +197,7 @@ def main():
                 logger.info(f"New post detected (ID: {status_id}): {post_text[:100]}...")
                 
                 # Summarize to Finnish
-                summary = summarize_to_finnish(openai_client, post_text)
+                summary = summarize_to_finnish(gemini_model, post_text)
                 
                 if summary:
                     # Prepare SMS message
