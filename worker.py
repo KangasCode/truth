@@ -40,6 +40,8 @@ MAX_STATUSES_TO_FETCH = 10
 def validate_env_vars() -> bool:
     """Validate that all required environment variables are set."""
     required_vars = [
+        ("TRUTH_SOCIAL_USERNAME", TRUTH_SOCIAL_USERNAME),
+        ("TRUTH_SOCIAL_PASSWORD", TRUTH_SOCIAL_PASSWORD),
         ("GEMINI_API_KEY", GEMINI_API_KEY),
         ("TWILIO_ACCOUNT_SID", TWILIO_ACCOUNT_SID),
         ("TWILIO_AUTH_TOKEN", TWILIO_AUTH_TOKEN),
@@ -133,9 +135,12 @@ def main():
     
     # Initialize API clients
     try:
-        # Try without authentication first (public profiles)
-        truth_api = TruthApi()
-        logger.info("Truth Social API initialized (no auth)")
+        logger.info(f"Initializing Truth Social API with user: {TRUTH_SOCIAL_USERNAME}")
+        truth_api = TruthApi(
+            username=TRUTH_SOCIAL_USERNAME,
+            password=TRUTH_SOCIAL_PASSWORD,
+        )
+        logger.info("Truth Social API initialized")
     except Exception as e:
         logger.error(f"Failed to initialize Truth Social API: {e}")
         return
