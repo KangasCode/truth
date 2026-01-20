@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """
-Background worker for monitoring Donald Trump's Truth Social posts.
-Sends summarized Finnish SMS notifications for each new post via Twilio.
+Background worker for sending daily weather-based clothing recommendations.
+Fetches tomorrow's weather forecast for Pirkkala from FMI and sends SMS via Twilio.
 Designed to run on Render.com as a background worker.
 """
 
 import os
-import re
 import time
 import logging
 import xml.etree.ElementTree as ET
-from datetime import datetime
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import requests
 import google.generativeai as genai
@@ -32,12 +32,13 @@ TWILIO_FROM_NUMBER = os.getenv("TWILIO_FROM_NUMBER")
 MY_PHONE_NUMBER = os.getenv("MY_PHONE_NUMBER")
 
 # Constants
-TARGET_ACCOUNT = "realDonaldTrump"
-TARGET_ACCOUNT_ID = "107780257626128497"  # Trump's Truth Social account ID
-# Use RSSHub public instance to get Truth Social feed
-RSSHUB_URL = "https://rsshub.app/truthsocial/user/realDonaldTrump"
-POLL_INTERVAL_SECONDS = 180  # 3 minutes
-MAX_STATUSES_TO_FETCH = 10
+LOCATION = "Pirkkala"
+FMI_API_URL = "https://opendata.fmi.fi/wfs"
+TIMEZONE = ZoneInfo("Europe/Helsinki")
+TARGET_HOUR = 20  # 20:00 illalla
+MORNING_SEND_HOUR = 9   # Aamulla klo 9:00 - tämän päivän illan sää
+EVENING_SEND_HOUR = 20  # Illalla klo 20:00 - huomisen illan sää
+CHECK_INTERVAL_SECONDS = 300  # Tarkista 5 min välein
 
 
 def validate_env_vars() -> bool:
@@ -58,66 +59,146 @@ def validate_env_vars() -> bool:
     return True
 
 
-def fetch_latest_statuses() -> list:
-    """Fetch the latest statuses from Trump's Truth Social account using RSSHub."""
+def fetch_weather_forecast(days_ahead: int = 1) -> dict | None:
+    """Fetch weather forecast for Pirkkala from FMI.
+    
+    Args:
+        days_ahead: 0 for today, 1 for tomorrow
+    """
     try:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "Accept": "application/rss+xml, application/xml, text/xml",
+        # Calculate target day at target hour
+        now = datetime.now(TIMEZONE)
+        target_day = now + timedelta(days=days_ahead)
+        target_time = target_day.replace(hour=TARGET_HOUR, minute=0, second=0, microsecond=0)
+        
+        # FMI API parameters
+        start_time = target_time - timedelta(hours=1)
+        end_time = target_time + timedelta(hours=1)
+        
+        params = {
+            "service": "WFS",
+            "version": "2.0.0",
+            "request": "getFeature",
+            "storedquery_id": "fmi::forecast::harmonie::surface::point::simple",
+            "place": LOCATION,
+            "starttime": start_time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "endtime": end_time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "parameters": "Temperature,WindSpeedMS,WindDirection,Precipitation1h,TotalCloudCover,WeatherSymbol3",
         }
         
-        response = requests.get(RSSHUB_URL, headers=headers, timeout=30)
+        logger.info(f"Fetching weather for {LOCATION} at {target_time.isoformat()}")
+        
+        response = requests.get(FMI_API_URL, params=params, timeout=30)
         response.raise_for_status()
         
-        # Parse RSS XML
+        # Parse XML response
         root = ET.fromstring(response.content)
         
-        statuses = []
-        for item in root.findall(".//item")[:MAX_STATUSES_TO_FETCH]:
-            # Extract data from RSS item
-            title = item.find("title")
-            description = item.find("description")
-            link = item.find("link")
-            guid = item.find("guid")
-            pub_date = item.find("pubDate")
-            
-            status = {
-                "id": guid.text if guid is not None else link.text if link is not None else str(hash(title.text if title is not None else "")),
-                "content": description.text if description is not None else (title.text if title is not None else ""),
-                "url": link.text if link is not None else "",
-                "created_at": pub_date.text if pub_date is not None else "",
-            }
-            statuses.append(status)
+        # FMI uses namespaces
+        ns = {
+            "wfs": "http://www.opengis.net/wfs/2.0",
+            "BsWfs": "http://xml.fmi.fi/schema/wfs/2.0",
+            "gml": "http://www.opengis.net/gml/3.2",
+        }
         
-        logger.info(f"Fetched {len(statuses)} statuses from RSSHub for @{TARGET_ACCOUNT}")
-        return statuses
+        weather_data = {
+            "temperature": None,
+            "wind_speed": None,
+            "wind_direction": None,
+            "precipitation": None,
+            "cloud_cover": None,
+            "time": target_time.strftime("%Y-%m-%d %H:%M"),
+            "location": LOCATION,
+        }
+        
+        # Extract values from XML
+        for member in root.findall(".//BsWfs:BsWfsElement", ns):
+            param_name = member.find("BsWfs:ParameterName", ns)
+            param_value = member.find("BsWfs:ParameterValue", ns)
+            
+            if param_name is not None and param_value is not None:
+                name = param_name.text
+                try:
+                    value = float(param_value.text) if param_value.text and param_value.text != "NaN" else None
+                except ValueError:
+                    value = None
+                
+                if name == "Temperature":
+                    weather_data["temperature"] = value
+                elif name == "WindSpeedMS":
+                    weather_data["wind_speed"] = value
+                elif name == "WindDirection":
+                    weather_data["wind_direction"] = value
+                elif name == "Precipitation1h":
+                    weather_data["precipitation"] = value
+                elif name == "TotalCloudCover":
+                    weather_data["cloud_cover"] = value
+        
+        logger.info(f"Weather data: {weather_data}")
+        return weather_data
+        
     except requests.exceptions.RequestException as e:
-        logger.error(f"Failed to fetch statuses from RSSHub: {e}")
-        return []
+        logger.error(f"Failed to fetch weather from FMI: {e}")
+        return None
     except ET.ParseError as e:
-        logger.error(f"Failed to parse RSS feed: {e}")
-        return []
+        logger.error(f"Failed to parse FMI response: {e}")
+        return None
     except Exception as e:
-        logger.error(f"Unexpected error fetching statuses: {e}")
-        return []
+        logger.error(f"Unexpected error fetching weather: {e}")
+        return None
 
 
-def summarize_to_finnish(gemini_model: genai.GenerativeModel, post_content: str) -> str | None:
-    """Use Gemini to summarize the post content into a single Finnish sentence."""
+def get_wind_direction_text(degrees: float | None) -> str:
+    """Convert wind direction degrees to Finnish text."""
+    if degrees is None:
+        return "tuntematon"
+    
+    directions = [
+        (0, "pohjoisesta"), (45, "koillisesta"), (90, "idästä"),
+        (135, "kaakosta"), (180, "etelästä"), (225, "lounaasta"),
+        (270, "lännestä"), (315, "luoteesta"), (360, "pohjoisesta")
+    ]
+    
+    for i, (deg, name) in enumerate(directions[:-1]):
+        next_deg = directions[i + 1][0]
+        if deg <= degrees < next_deg:
+            # Return closer direction
+            if degrees - deg < next_deg - degrees:
+                return name
+            return directions[i + 1][1]
+    return "pohjoisesta"
+
+
+def generate_clothing_recommendation(gemini_model: genai.GenerativeModel, weather: dict) -> str | None:
+    """Use Gemini to generate clothing recommendation based on weather."""
     try:
+        temp = weather.get("temperature")
+        wind = weather.get("wind_speed")
+        wind_dir = get_wind_direction_text(weather.get("wind_direction"))
+        precip = weather.get("precipitation", 0) or 0
+        
+        weather_desc = f"""
+Sää Pirkkalassa klo 20:00:
+- Lämpötila: {temp:.1f}°C
+- Tuuli: {wind:.1f} m/s {wind_dir}
+- Sademäärä (1h): {precip:.1f} mm
+"""
+        
         prompt = (
-            "Tiivistä seuraava Trumpin julkaisu suomeksi MAKSIMISSAAN 130 merkillä. "
-            "TÄRKEÄÄ: Älä heikennä tai pehmentä Trumpin käyttämiä sanoja - säilytä alkuperäinen sävy ja voima. "
-            "Voit laittaa sulkeisiin englanninkielisen alkuperäisen sanan jos se on olennainen, esim. 'valeuutiset (Fake News)'. "
-            "Vastaa VAIN tiivistelmällä, ei mitään muuta.\n\n"
-            f"Julkaisu:\n{post_content}"
+            "Olet pukeutumisneuvoja. Annan sinulle sääennusteen ja haluan LYHYEN (max 160 merkkiä) "
+            "suosituksen mitä pukea päälle ulos lähtiessä. "
+            "Vastaa suomeksi, ytimekkäästi, suoraan pukeutumisohjeella. "
+            "Älä toista säätietoja, keskity vain vaatesuositukseen.\n\n"
+            f"{weather_desc}"
         )
+        
         response = gemini_model.generate_content(prompt)
-        summary = response.text.strip()
-        logger.info(f"Generated Finnish summary: {summary}")
-        return summary
+        recommendation = response.text.strip()
+        logger.info(f"Clothing recommendation: {recommendation}")
+        return recommendation
+        
     except Exception as e:
-        logger.error(f"Failed to summarize post with Gemini: {e}")
+        logger.error(f"Failed to generate recommendation with Gemini: {e}")
         return None
 
 
@@ -136,31 +217,42 @@ def send_sms(twilio_client: TwilioClient, message: str) -> bool:
         return False
 
 
-def extract_post_text(status: dict) -> str:
-    """Extract clean text content from a status object."""
-    content = status.get("content", "")
+def format_weather_sms(weather: dict, recommendation: str, when: str = "huomenna") -> str:
+    """Format the weather SMS message.
     
-    if not content:
-        return ""
+    Args:
+        weather: Weather data dict
+        recommendation: Clothing recommendation from Gemini
+        when: "tänään" or "huomenna"
+    """
+    temp = weather.get("temperature")
+    wind = weather.get("wind_speed")
+    wind_dir = get_wind_direction_text(weather.get("wind_direction"))
+    precip = weather.get("precipitation", 0) or 0
     
-    # Basic HTML tag stripping
-    clean_text = re.sub(r"<[^>]+>", "", content)
-    clean_text = clean_text.replace("&amp;", "&")
-    clean_text = clean_text.replace("&lt;", "<")
-    clean_text = clean_text.replace("&gt;", ">")
-    clean_text = clean_text.replace("&quot;", '"')
-    clean_text = clean_text.replace("&#39;", "'")
-    clean_text = clean_text.replace("&nbsp;", " ")
-    # Clean up extra whitespace
-    clean_text = re.sub(r"\s+", " ", clean_text)
-    clean_text = clean_text.strip()
+    # Precipitation description
+    if precip == 0:
+        precip_text = "Ei sadetta"
+    elif precip < 0.5:
+        precip_text = "Heikkoa sadetta"
+    elif precip < 2:
+        precip_text = "Sadetta"
+    else:
+        precip_text = "Kovaa sadetta"
     
-    return clean_text
+    message = (
+        f"🌤️ Pirkkala {when} klo 20:\n"
+        f"🌡️ {temp:.0f}°C | 💨 {wind:.0f} m/s {wind_dir}\n"
+        f"🌧️ {precip_text}\n\n"
+        f"👕 {recommendation}"
+    )
+    
+    return message
 
 
 def main():
     """Main loop for the background worker."""
-    logger.info("Starting Truth Social monitor worker...")
+    logger.info("Starting Pirkkala weather notification worker...")
     
     if not validate_env_vars():
         logger.error("Exiting due to missing environment variables.")
@@ -174,83 +266,80 @@ def main():
     twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
     logger.info("Twilio client initialized")
     
-    # Track the last processed post ID (in-memory, resets on restart)
-    last_processed_id: str | None = None
-    first_run = True
+    # Track sent notifications: "YYYY-MM-DD-morning" or "YYYY-MM-DD-evening"
+    sent_notifications: set = set()
     
-    logger.info(f"Starting main loop. Polling every {POLL_INTERVAL_SECONDS} seconds...")
-    logger.info(f"Monitoring @{TARGET_ACCOUNT} (ID: {TARGET_ACCOUNT_ID})")
+    logger.info(f"Starting main loop. Notifications at {MORNING_SEND_HOUR}:00 and {EVENING_SEND_HOUR}:00...")
     
     while True:
         try:
-            logger.info(f"Checking for new posts at {datetime.now().isoformat()}")
+            now = datetime.now(TIMEZONE)
+            today_str = now.strftime("%Y-%m-%d")
+            current_hour = now.hour
             
-            statuses = fetch_latest_statuses()
+            morning_key = f"{today_str}-morning"
+            evening_key = f"{today_str}-evening"
             
-            if not statuses:
-                logger.info("No statuses fetched, will retry next cycle")
-                time.sleep(POLL_INTERVAL_SECONDS)
-                continue
+            logger.info(f"Current time: {now.strftime('%H:%M')}")
             
-            # Sort statuses by ID (ascending) to process oldest first
-            statuses_sorted = sorted(statuses, key=lambda s: s.get("id", "0"))
-            
-            if first_run:
-                # On first run, just record the latest ID without sending SMS
-                latest_status = statuses_sorted[-1] if statuses_sorted else None
-                if latest_status:
-                    last_processed_id = latest_status.get("id")
-                    logger.info(f"First run: recorded latest post ID as {last_processed_id}")
-                first_run = False
-                time.sleep(POLL_INTERVAL_SECONDS)
-                continue
-            
-            # Process new posts
-            new_posts_count = 0
-            for status in statuses_sorted:
-                status_id = status.get("id")
+            # Morning notification at 9:00 - today's evening weather
+            if current_hour == MORNING_SEND_HOUR and morning_key not in sent_notifications:
+                logger.info("☀️ Sending MORNING notification (today's evening weather)...")
                 
-                # Skip if we've already processed this or older posts
-                if last_processed_id and status_id <= last_processed_id:
-                    continue
+                # Fetch TODAY's weather (days_ahead=0)
+                weather = fetch_weather_forecast(days_ahead=0)
                 
-                new_posts_count += 1
-                post_text = extract_post_text(status)
-                
-                if not post_text:
-                    logger.warning(f"Post {status_id} has no text content, skipping")
-                    last_processed_id = status_id
-                    continue
-                
-                logger.info(f"New post detected (ID: {status_id}): {post_text[:100]}...")
-                
-                # Summarize to Finnish
-                summary = summarize_to_finnish(gemini_model, post_text)
-                
-                if summary:
-                    sms_message = f"🇺🇸 Trump: {summary}"
+                if weather and weather.get("temperature") is not None:
+                    recommendation = generate_clothing_recommendation(gemini_model, weather)
                     
-                    if len(sms_message) > 320:
-                        sms_message = sms_message[:317] + "..."
-                    
-                    send_sms(twilio_client, sms_message)
+                    if recommendation:
+                        sms_message = format_weather_sms(weather, recommendation, "tänään")
+                        if send_sms(twilio_client, sms_message):
+                            sent_notifications.add(morning_key)
+                            logger.info(f"Morning notification sent for {today_str}")
+                    else:
+                        sms_message = format_weather_sms(weather, "Pukeudu sään mukaan!", "tänään")
+                        send_sms(twilio_client, sms_message)
+                        sent_notifications.add(morning_key)
                 else:
-                    logger.warning(f"Could not summarize post {status_id}, sending original")
-                    fallback_msg = f"🇺🇸 Trump: {post_text[:280]}..."
-                    send_sms(twilio_client, fallback_msg)
-                
-                last_processed_id = status_id
+                    logger.error("Could not fetch weather data for morning notification")
             
-            if new_posts_count == 0:
-                logger.info("No new posts found")
-            else:
-                logger.info(f"Processed {new_posts_count} new post(s)")
+            # Evening notification at 20:00 - tomorrow's evening weather
+            elif current_hour == EVENING_SEND_HOUR and evening_key not in sent_notifications:
+                logger.info("🌙 Sending EVENING notification (tomorrow's evening weather)...")
                 
+                # Fetch TOMORROW's weather (days_ahead=1)
+                weather = fetch_weather_forecast(days_ahead=1)
+                
+                if weather and weather.get("temperature") is not None:
+                    recommendation = generate_clothing_recommendation(gemini_model, weather)
+                    
+                    if recommendation:
+                        sms_message = format_weather_sms(weather, recommendation, "huomenna")
+                        if send_sms(twilio_client, sms_message):
+                            sent_notifications.add(evening_key)
+                            logger.info(f"Evening notification sent for {today_str}")
+                    else:
+                        sms_message = format_weather_sms(weather, "Pukeudu sään mukaan!", "huomenna")
+                        send_sms(twilio_client, sms_message)
+                        sent_notifications.add(evening_key)
+                else:
+                    logger.error("Could not fetch weather data for evening notification")
+            
+            else:
+                next_send = MORNING_SEND_HOUR if current_hour < MORNING_SEND_HOUR else (
+                    EVENING_SEND_HOUR if current_hour < EVENING_SEND_HOUR else MORNING_SEND_HOUR
+                )
+                logger.info(f"Waiting... Next notification at {next_send}:00")
+            
+            # Clean up old entries (keep only today's)
+            sent_notifications = {k for k in sent_notifications if k.startswith(today_str)}
+                    
         except Exception as e:
             logger.error(f"Unexpected error in main loop: {e}")
         
-        logger.info(f"Sleeping for {POLL_INTERVAL_SECONDS} seconds...")
-        time.sleep(POLL_INTERVAL_SECONDS)
+        logger.info(f"Sleeping for {CHECK_INTERVAL_SECONDS} seconds...")
+        time.sleep(CHECK_INTERVAL_SECONDS)
 
 
 if __name__ == "__main__":
