@@ -1,0 +1,3 @@
+truthbrush>=0.6.0
+openai>=1.0.0
+twilio>=8.0.0
