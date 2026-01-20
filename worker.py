@@ -60,7 +60,12 @@ def validate_env_vars() -> bool:
 def fetch_latest_statuses(truth_api: TruthApi) -> list:
     """Fetch the latest statuses from the target Truth Social account."""
     try:
-        statuses = list(truth_api.pull_statuses(TARGET_ACCOUNT, max_count=MAX_STATUSES_TO_FETCH))
+        # pull_statuses returns a generator, take only first MAX_STATUSES_TO_FETCH
+        statuses = []
+        for i, status in enumerate(truth_api.pull_statuses(TARGET_ACCOUNT)):
+            if i >= MAX_STATUSES_TO_FETCH:
+                break
+            statuses.append(status)
         logger.info(f"Fetched {len(statuses)} statuses from @{TARGET_ACCOUNT}")
         return statuses
     except Exception as e:
