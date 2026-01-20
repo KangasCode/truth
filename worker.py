@@ -6,11 +6,12 @@ Designed to run on Render.com as a background worker.
 """
 
 import os
+import re
 import time
 import logging
 from datetime import datetime
 
-from truthbrush import Api as TruthApi
+import requests
 import google.generativeai as genai
 from twilio.rest import Client as TwilioClient
 
@@ -23,8 +24,6 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Environment variables
-TRUTH_SOCIAL_USERNAME = os.getenv("TRUTH_SOCIAL_USERNAME")
-TRUTH_SOCIAL_PASSWORD = os.getenv("TRUTH_SOCIAL_PASSWORD")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
@@ -33,6 +32,8 @@ MY_PHONE_NUMBER = os.getenv("MY_PHONE_NUMBER")
 
 # Constants
 TARGET_ACCOUNT = "realDonaldTrump"
+TARGET_ACCOUNT_ID = "107780257626128497"  # Trump's Truth Social account ID
+TRUTH_SOCIAL_API = "https://truthsocial.com/api/v1"
 POLL_INTERVAL_SECONDS = 180  # 3 minutes
 MAX_STATUSES_TO_FETCH = 10
 
@@ -40,8 +41,6 @@ MAX_STATUSES_TO_FETCH = 10
 def validate_env_vars() -> bool:
     """Validate that all required environment variables are set."""
     required_vars = [
-        ("TRUTH_SOCIAL_USERNAME", TRUTH_SOCIAL_USERNAME),
-        ("TRUTH_SOCIAL_PASSWORD", TRUTH_SOCIAL_PASSWORD),
         ("GEMINI_API_KEY", GEMINI_API_KEY),
         ("TWILIO_ACCOUNT_SID", TWILIO_ACCOUNT_SID),
         ("TWILIO_AUTH_TOKEN", TWILIO_AUTH_TOKEN),
@@ -57,19 +56,30 @@ def validate_env_vars() -> bool:
     return True
 
 
-def fetch_latest_statuses(truth_api: TruthApi) -> list:
-    """Fetch the latest statuses from the target Truth Social account."""
+def fetch_latest_statuses() -> list:
+    """Fetch the latest statuses from Trump's Truth Social account using public API."""
     try:
-        # pull_statuses returns a generator, take only first MAX_STATUSES_TO_FETCH
-        statuses = []
-        for i, status in enumerate(truth_api.pull_statuses(TARGET_ACCOUNT)):
-            if i >= MAX_STATUSES_TO_FETCH:
-                break
-            statuses.append(status)
+        url = f"{TRUTH_SOCIAL_API}/accounts/{TARGET_ACCOUNT_ID}/statuses"
+        params = {
+            "limit": MAX_STATUSES_TO_FETCH,
+            "exclude_replies": "true",
+        }
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept": "application/json",
+        }
+        
+        response = requests.get(url, params=params, headers=headers, timeout=30)
+        response.raise_for_status()
+        
+        statuses = response.json()
         logger.info(f"Fetched {len(statuses)} statuses from @{TARGET_ACCOUNT}")
         return statuses
-    except Exception as e:
+    except requests.exceptions.RequestException as e:
         logger.error(f"Failed to fetch statuses: {e}")
+        return []
+    except Exception as e:
+        logger.error(f"Unexpected error fetching statuses: {e}")
         return []
 
 
@@ -109,11 +119,9 @@ def send_sms(twilio_client: TwilioClient, message: str) -> bool:
 
 def extract_post_text(status: dict) -> str:
     """Extract clean text content from a status object."""
-    # The status typically has 'content' field with HTML
     content = status.get("content", "")
     
-    # Basic HTML tag stripping (for simple cases)
-    import re
+    # Basic HTML tag stripping
     clean_text = re.sub(r"<[^>]+>", "", content)
     clean_text = clean_text.replace("&amp;", "&")
     clean_text = clean_text.replace("&lt;", "<")
@@ -121,6 +129,31 @@ def extract_post_text(status: dict) -> str:
     clean_text = clean_text.replace("&quot;", '"')
     clean_text = clean_text.replace("&#39;", "'")
     clean_text = clean_text.strip()
+    
+    # Handle reblogs (retweets)
+    reblog = status.get("reblog")
+    if reblog:
+        reblog_account = reblog.get("account", {}).get("username", "unknown")
+        reblog_content = extract_post_text(reblog)
+        clean_text = f"RT @{reblog_account}: {reblog_content}"
+    
+    # Handle media attachments
+    media = status.get("media_attachments", [])
+    if media and not clean_text:
+        media_types = [m.get("type", "media") for m in media]
+        if "video" in media_types:
+            clean_text = "[Video]"
+        elif "image" in media_types:
+            clean_text = "[Kuva]"
+        else:
+            clean_text = "[Media]"
+    elif media:
+        # Add media indicator to existing text
+        media_types = [m.get("type", "media") for m in media]
+        if "video" in media_types:
+            clean_text = f"[Video] {clean_text}"
+        elif "image" in media_types:
+            clean_text = f"[Kuva] {clean_text}"
     
     return clean_text
 
@@ -134,17 +167,6 @@ def main():
         return
     
     # Initialize API clients
-    try:
-        logger.info(f"Initializing Truth Social API with user: {TRUTH_SOCIAL_USERNAME}")
-        truth_api = TruthApi(
-            username=TRUTH_SOCIAL_USERNAME,
-            password=TRUTH_SOCIAL_PASSWORD,
-        )
-        logger.info("Truth Social API initialized")
-    except Exception as e:
-        logger.error(f"Failed to initialize Truth Social API: {e}")
-        return
-    
     genai.configure(api_key=GEMINI_API_KEY)
     gemini_model = genai.GenerativeModel("gemini-1.5-flash")
     logger.info("Gemini client initialized")
@@ -153,17 +175,17 @@ def main():
     logger.info("Twilio client initialized")
     
     # Track the last processed post ID (in-memory, resets on restart)
-    # On first run, we'll just record the latest ID without sending notifications
     last_processed_id: str | None = None
     first_run = True
     
     logger.info(f"Starting main loop. Polling every {POLL_INTERVAL_SECONDS} seconds...")
+    logger.info(f"Monitoring @{TARGET_ACCOUNT} (ID: {TARGET_ACCOUNT_ID})")
     
     while True:
         try:
             logger.info(f"Checking for new posts at {datetime.now().isoformat()}")
             
-            statuses = fetch_latest_statuses(truth_api)
+            statuses = fetch_latest_statuses()
             
             if not statuses:
                 logger.info("No statuses fetched, will retry next cycle")
@@ -175,7 +197,6 @@ def main():
             
             if first_run:
                 # On first run, just record the latest ID without sending SMS
-                # This prevents sending notifications for old posts on restart
                 latest_status = statuses_sorted[-1] if statuses_sorted else None
                 if latest_status:
                     last_processed_id = latest_status.get("id")
@@ -207,22 +228,17 @@ def main():
                 summary = summarize_to_finnish(gemini_model, post_text)
                 
                 if summary:
-                    # Prepare SMS message
                     sms_message = f"🇺🇸 Trump: {summary}"
                     
-                    # Truncate if too long for SMS (160 chars standard, but Twilio handles longer)
                     if len(sms_message) > 320:
                         sms_message = sms_message[:317] + "..."
                     
-                    # Send SMS
                     send_sms(twilio_client, sms_message)
                 else:
                     logger.warning(f"Could not summarize post {status_id}, sending original")
-                    # Fallback: send truncated original
                     fallback_msg = f"🇺🇸 Trump: {post_text[:280]}..."
                     send_sms(twilio_client, fallback_msg)
                 
-                # Update last processed ID
                 last_processed_id = status_id
             
             if new_posts_count == 0:
@@ -232,9 +248,7 @@ def main():
                 
         except Exception as e:
             logger.error(f"Unexpected error in main loop: {e}")
-            # Continue running despite errors
         
-        # Wait before next poll
         logger.info(f"Sleeping for {POLL_INTERVAL_SECONDS} seconds...")
         time.sleep(POLL_INTERVAL_SECONDS)
 
