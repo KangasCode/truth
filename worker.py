@@ -9,6 +9,7 @@ import os
 import re
 import time
 import logging
+import xml.etree.ElementTree as ET
 from datetime import datetime
 
 import requests
@@ -33,7 +34,8 @@ MY_PHONE_NUMBER = os.getenv("MY_PHONE_NUMBER")
 # Constants
 TARGET_ACCOUNT = "realDonaldTrump"
 TARGET_ACCOUNT_ID = "107780257626128497"  # Trump's Truth Social account ID
-TRUTH_SOCIAL_API = "https://truthsocial.com/api/v1"
+# Use RSSHub public instance to get Truth Social feed
+RSSHUB_URL = "https://rsshub.app/truthsocial/user/realDonaldTrump"
 POLL_INTERVAL_SECONDS = 180  # 3 minutes
 MAX_STATUSES_TO_FETCH = 10
 
@@ -57,37 +59,43 @@ def validate_env_vars() -> bool:
 
 
 def fetch_latest_statuses() -> list:
-    """Fetch the latest statuses from Trump's Truth Social account using public API."""
+    """Fetch the latest statuses from Trump's Truth Social account using RSSHub."""
     try:
-        url = f"{TRUTH_SOCIAL_API}/accounts/{TARGET_ACCOUNT_ID}/statuses"
-        params = {
-            "limit": MAX_STATUSES_TO_FETCH,
-            "exclude_replies": "true",
-        }
         headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Accept": "application/json, text/plain, */*",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Accept-Encoding": "gzip, deflate, br",
-            "Origin": "https://truthsocial.com",
-            "Referer": "https://truthsocial.com/@realDonaldTrump",
-            "Sec-Ch-Ua": '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
-            "Sec-Ch-Ua-Mobile": "?0",
-            "Sec-Ch-Ua-Platform": '"Windows"',
-            "Sec-Fetch-Dest": "empty",
-            "Sec-Fetch-Mode": "cors",
-            "Sec-Fetch-Site": "same-origin",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept": "application/rss+xml, application/xml, text/xml",
         }
         
-        session = requests.Session()
-        response = session.get(url, params=params, headers=headers, timeout=30)
+        response = requests.get(RSSHUB_URL, headers=headers, timeout=30)
         response.raise_for_status()
         
-        statuses = response.json()
-        logger.info(f"Fetched {len(statuses)} statuses from @{TARGET_ACCOUNT}")
+        # Parse RSS XML
+        root = ET.fromstring(response.content)
+        
+        statuses = []
+        for item in root.findall(".//item")[:MAX_STATUSES_TO_FETCH]:
+            # Extract data from RSS item
+            title = item.find("title")
+            description = item.find("description")
+            link = item.find("link")
+            guid = item.find("guid")
+            pub_date = item.find("pubDate")
+            
+            status = {
+                "id": guid.text if guid is not None else link.text if link is not None else str(hash(title.text if title is not None else "")),
+                "content": description.text if description is not None else (title.text if title is not None else ""),
+                "url": link.text if link is not None else "",
+                "created_at": pub_date.text if pub_date is not None else "",
+            }
+            statuses.append(status)
+        
+        logger.info(f"Fetched {len(statuses)} statuses from RSSHub for @{TARGET_ACCOUNT}")
         return statuses
     except requests.exceptions.RequestException as e:
-        logger.error(f"Failed to fetch statuses: {e}")
+        logger.error(f"Failed to fetch statuses from RSSHub: {e}")
+        return []
+    except ET.ParseError as e:
+        logger.error(f"Failed to parse RSS feed: {e}")
         return []
     except Exception as e:
         logger.error(f"Unexpected error fetching statuses: {e}")
@@ -132,6 +140,9 @@ def extract_post_text(status: dict) -> str:
     """Extract clean text content from a status object."""
     content = status.get("content", "")
     
+    if not content:
+        return ""
+    
     # Basic HTML tag stripping
     clean_text = re.sub(r"<[^>]+>", "", content)
     clean_text = clean_text.replace("&amp;", "&")
@@ -139,32 +150,10 @@ def extract_post_text(status: dict) -> str:
     clean_text = clean_text.replace("&gt;", ">")
     clean_text = clean_text.replace("&quot;", '"')
     clean_text = clean_text.replace("&#39;", "'")
+    clean_text = clean_text.replace("&nbsp;", " ")
+    # Clean up extra whitespace
+    clean_text = re.sub(r"\s+", " ", clean_text)
     clean_text = clean_text.strip()
-    
-    # Handle reblogs (retweets)
-    reblog = status.get("reblog")
-    if reblog:
-        reblog_account = reblog.get("account", {}).get("username", "unknown")
-        reblog_content = extract_post_text(reblog)
-        clean_text = f"RT @{reblog_account}: {reblog_content}"
-    
-    # Handle media attachments
-    media = status.get("media_attachments", [])
-    if media and not clean_text:
-        media_types = [m.get("type", "media") for m in media]
-        if "video" in media_types:
-            clean_text = "[Video]"
-        elif "image" in media_types:
-            clean_text = "[Kuva]"
-        else:
-            clean_text = "[Media]"
-    elif media:
-        # Add media indicator to existing text
-        media_types = [m.get("type", "media") for m in media]
-        if "video" in media_types:
-            clean_text = f"[Video] {clean_text}"
-        elif "image" in media_types:
-            clean_text = f"[Kuva] {clean_text}"
     
     return clean_text
 
