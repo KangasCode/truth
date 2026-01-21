@@ -18,7 +18,7 @@ from twilio.rest import Client as TwilioClient
 
 # Configure logging
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.INFO,e
     format="%(asctime)s - %(levelname)s - %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
@@ -35,9 +35,15 @@ MY_PHONE_NUMBER = os.getenv("MY_PHONE_NUMBER")
 LOCATION = "Pirkkala"
 FMI_API_URL = "https://opendata.fmi.fi/wfs"
 TIMEZONE = ZoneInfo("Europe/Helsinki")
-TARGET_HOUR = 20  # 20:00 illalla
-MORNING_SEND_HOUR = 9   # Aamulla klo 9:00 - tämän päivän illan sää
-EVENING_SEND_HOUR = 20  # Illalla klo 20:00 - huomisen illan sää
+
+# Notification times
+MORNING_SEND_HOUR = 9   # Lähetysaika: klo 9:00
+EVENING_SEND_HOUR = 20  # Lähetysaika: klo 20:00
+
+# Weather forecast target times
+AFTERNOON_TARGET_HOUR = 16  # Töistä lähtö klo 16:00 (haetaan aamulla)
+MORNING_TARGET_HOUR = 8     # Töihin meno klo 8:00 (haetaan illalla)
+
 CHECK_INTERVAL_SECONDS = 300  # Tarkista 5 min välein
 
 
@@ -59,17 +65,18 @@ def validate_env_vars() -> bool:
     return True
 
 
-def fetch_weather_forecast(days_ahead: int = 1) -> dict | None:
+def fetch_weather_forecast(days_ahead: int = 0, target_hour: int = 16) -> dict | None:
     """Fetch weather forecast for Pirkkala from FMI.
     
     Args:
         days_ahead: 0 for today, 1 for tomorrow
+        target_hour: Hour of day to get forecast for (0-23)
     """
     try:
         # Calculate target day at target hour
         now = datetime.now(TIMEZONE)
         target_day = now + timedelta(days=days_ahead)
-        target_time = target_day.replace(hour=TARGET_HOUR, minute=0, second=0, microsecond=0)
+        target_time = target_day.replace(hour=target_hour, minute=0, second=0, microsecond=0)
         
         # FMI API parameters
         start_time = target_time - timedelta(hours=1)
@@ -178,15 +185,15 @@ def generate_clothing_recommendation(gemini_model: genai.GenerativeModel, weathe
         precip = weather.get("precipitation", 0) or 0
         
         weather_desc = f"""
-Sää Pirkkalassa klo 20:00:
+Sää Pirkkalassa:
 - Lämpötila: {temp:.1f}°C
 - Tuuli: {wind:.1f} m/s {wind_dir}
 - Sademäärä (1h): {precip:.1f} mm
 """
         
         prompt = (
-            "Olet pukeutumisneuvoja. Annan sinulle sääennusteen ja haluan LYHYEN (max 160 merkkiä) "
-            "suosituksen mitä pukea päälle ulos lähtiessä. "
+            "Olet pukeutumisneuvoja. Annan sinulle sääennusteen ja haluan LYHYEN (max 140 merkkiä) "
+            "suosituksen mitä pukea päälle töihin/töistä lähtiessä. "
             "Vastaa suomeksi, ytimekkäästi, suoraan pukeutumisohjeella. "
             "Älä toista säätietoja, keskity vain vaatesuositukseen.\n\n"
             f"{weather_desc}"
@@ -217,13 +224,14 @@ def send_sms(twilio_client: TwilioClient, message: str) -> bool:
         return False
 
 
-def format_weather_sms(weather: dict, recommendation: str, when: str = "huomenna") -> str:
+def format_weather_sms(weather: dict, recommendation: str, when: str = "huomenna", hour: int = 16) -> str:
     """Format the weather SMS message.
     
     Args:
         weather: Weather data dict
         recommendation: Clothing recommendation from Gemini
         when: "tänään" or "huomenna"
+        hour: Target hour (8 or 16)
     """
     temp = weather.get("temperature")
     wind = weather.get("wind_speed")
@@ -240,8 +248,14 @@ def format_weather_sms(weather: dict, recommendation: str, when: str = "huomenna
     else:
         precip_text = "Kovaa sadetta"
     
+    # Context based on time
+    if hour == 8:
+        context = "🚗 Töihin"
+    else:
+        context = "🏠 Töistä"
+    
     message = (
-        f"🌤️ Pirkkala {when} klo 20:\n"
+        f"{context} - Pirkkala {when} klo {hour}:\n"
         f"🌡️ {temp:.0f}°C | 💨 {wind:.0f} m/s {wind_dir}\n"
         f"🌧️ {precip_text}\n\n"
         f"👕 {recommendation}"
@@ -282,45 +296,45 @@ def main():
             
             logger.info(f"Current time: {now.strftime('%H:%M')}")
             
-            # Morning notification at 9:00 - today's evening weather
+            # Morning notification at 9:00 - today's 16:00 weather (leaving work)
             if current_hour == MORNING_SEND_HOUR and morning_key not in sent_notifications:
-                logger.info("☀️ Sending MORNING notification (today's evening weather)...")
+                logger.info("☀️ Sending MORNING notification (today 16:00 - leaving work)...")
                 
-                # Fetch TODAY's weather (days_ahead=0)
-                weather = fetch_weather_forecast(days_ahead=0)
+                # Fetch TODAY's 16:00 weather
+                weather = fetch_weather_forecast(days_ahead=0, target_hour=AFTERNOON_TARGET_HOUR)
                 
                 if weather and weather.get("temperature") is not None:
                     recommendation = generate_clothing_recommendation(gemini_model, weather)
                     
                     if recommendation:
-                        sms_message = format_weather_sms(weather, recommendation, "tänään")
+                        sms_message = format_weather_sms(weather, recommendation, "tänään", AFTERNOON_TARGET_HOUR)
                         if send_sms(twilio_client, sms_message):
                             sent_notifications.add(morning_key)
                             logger.info(f"Morning notification sent for {today_str}")
                     else:
-                        sms_message = format_weather_sms(weather, "Pukeudu sään mukaan!", "tänään")
+                        sms_message = format_weather_sms(weather, "Pukeudu sään mukaan!", "tänään", AFTERNOON_TARGET_HOUR)
                         send_sms(twilio_client, sms_message)
                         sent_notifications.add(morning_key)
                 else:
                     logger.error("Could not fetch weather data for morning notification")
             
-            # Evening notification at 20:00 - tomorrow's evening weather
+            # Evening notification at 20:00 - tomorrow's 8:00 weather (going to work)
             elif current_hour == EVENING_SEND_HOUR and evening_key not in sent_notifications:
-                logger.info("🌙 Sending EVENING notification (tomorrow's evening weather)...")
+                logger.info("🌙 Sending EVENING notification (tomorrow 08:00 - going to work)...")
                 
-                # Fetch TOMORROW's weather (days_ahead=1)
-                weather = fetch_weather_forecast(days_ahead=1)
+                # Fetch TOMORROW's 08:00 weather
+                weather = fetch_weather_forecast(days_ahead=1, target_hour=MORNING_TARGET_HOUR)
                 
                 if weather and weather.get("temperature") is not None:
                     recommendation = generate_clothing_recommendation(gemini_model, weather)
                     
                     if recommendation:
-                        sms_message = format_weather_sms(weather, recommendation, "huomenna")
+                        sms_message = format_weather_sms(weather, recommendation, "huomenna", MORNING_TARGET_HOUR)
                         if send_sms(twilio_client, sms_message):
                             sent_notifications.add(evening_key)
                             logger.info(f"Evening notification sent for {today_str}")
                     else:
-                        sms_message = format_weather_sms(weather, "Pukeudu sään mukaan!", "huomenna")
+                        sms_message = format_weather_sms(weather, "Pukeudu sään mukaan!", "huomenna", MORNING_TARGET_HOUR)
                         send_sms(twilio_client, sms_message)
                         sent_notifications.add(evening_key)
                 else:
