@@ -13,7 +13,8 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import requests
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 from twilio.rest import Client as TwilioClient
 
 # Configure logging
@@ -176,7 +177,7 @@ def get_wind_direction_text(degrees: float | None) -> str:
     return "pohjoisesta"
 
 
-def generate_clothing_recommendation(gemini_model: genai.GenerativeModel, weather: dict) -> str | None:
+def generate_clothing_recommendation(gemini_client: genai.Client, weather: dict) -> str | None:
     """Use Gemini to generate clothing recommendation based on weather."""
     try:
         temp = weather.get("temperature")
@@ -202,7 +203,10 @@ Sää Pirkkalassa:
         logger.info(f"Sending to Gemini - Weather: temp={temp}, wind={wind}, precip={precip}")
         logger.info(f"Gemini prompt: {prompt[:200]}...")
         
-        response = gemini_model.generate_content(prompt)
+        response = gemini_client.models.generate_content(
+            model="gemini-2.0-flash",
+            contents=prompt
+        )
         
         if response and response.text:
             recommendation = response.text.strip()
@@ -283,8 +287,7 @@ def main():
         return
     
     # Initialize API clients
-    genai.configure(api_key=GEMINI_API_KEY)
-    gemini_model = genai.GenerativeModel("gemini-1.5-flash")
+    gemini_client = genai.Client(api_key=GEMINI_API_KEY)
     logger.info("Gemini client initialized")
     
     twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
@@ -314,7 +317,7 @@ def main():
                 weather = fetch_weather_forecast(days_ahead=0, target_hour=AFTERNOON_TARGET_HOUR)
                 
                 if weather and weather.get("temperature") is not None:
-                    recommendation = generate_clothing_recommendation(gemini_model, weather)
+                    recommendation = generate_clothing_recommendation(gemini_client, weather)
                     
                     if recommendation:
                         sms_message = format_weather_sms(weather, recommendation, "tänään", AFTERNOON_TARGET_HOUR)
@@ -336,7 +339,7 @@ def main():
                 weather = fetch_weather_forecast(days_ahead=1, target_hour=MORNING_TARGET_HOUR)
                 
                 if weather and weather.get("temperature") is not None:
-                    recommendation = generate_clothing_recommendation(gemini_model, weather)
+                    recommendation = generate_clothing_recommendation(gemini_client, weather)
                     
                     if recommendation:
                         sms_message = format_weather_sms(weather, recommendation, "huomenna", MORNING_TARGET_HOUR)
