@@ -18,7 +18,7 @@ from twilio.rest import Client as TwilioClient
 
 # Configure logging
 logging.basicConfig(
-    level=logging.INFO,e
+    level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
@@ -199,13 +199,23 @@ Sää Pirkkalassa:
             f"{weather_desc}"
         )
         
+        logger.info(f"Sending to Gemini - Weather: temp={temp}, wind={wind}, precip={precip}")
+        logger.info(f"Gemini prompt: {prompt[:200]}...")
+        
         response = gemini_model.generate_content(prompt)
-        recommendation = response.text.strip()
-        logger.info(f"Clothing recommendation: {recommendation}")
-        return recommendation
+        
+        if response and response.text:
+            recommendation = response.text.strip()
+            logger.info(f"Gemini response SUCCESS: {recommendation}")
+            return recommendation
+        else:
+            logger.error(f"Gemini returned empty response. Response object: {response}")
+            return None
         
     except Exception as e:
-        logger.error(f"Failed to generate recommendation with Gemini: {e}")
+        logger.error(f"Failed to generate recommendation with Gemini: {type(e).__name__}: {e}")
+        import traceback
+        logger.error(f"Traceback: {traceback.format_exc()}")
         return None
 
 
